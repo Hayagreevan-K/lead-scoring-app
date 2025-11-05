@@ -54,16 +54,20 @@ def detect_target_candidates(df):
     if not candidates:
         for c in df.columns:
             u = df[c].dropna().unique()
-            if set(u).issubset({0,1}) or len(u) == 2:
-                candidates.append(c)
-                break
+            try:
+                if set(u).issubset({0,1}) or len(u) == 2:
+                    candidates.append(c)
+                    break
+            except Exception:
+                continue
     return candidates
 
 def extract_feature_names(pipeline, input_df):
     try:
-        preproc = pipeline.named_steps.get('preproc', None)
+        preproc = pipeline.named_steps.get('preproc', pipeline.named_steps.get('preprocessor', None))
         if preproc is None:
             return None
+        # get_feature_names_out expects string column names
         names = preproc.get_feature_names_out(input_df.columns)
         return list(names)
     except Exception:
@@ -192,28 +196,66 @@ raw_for_scoring = uploaded_df.copy()
 if target_col and target_col in raw_for_scoring.columns:
     raw_for_scoring = raw_for_scoring.drop(columns=[target_col])
 
-# ✅ FIX: ensure all column names are strings to avoid mixed-type KeyError
-raw_for_scoring.columns = raw_for_scoring.columns.map(str)
+# ---------- Robust column-name normalization & alignment ----------
+# 1) ensure DataFrame column names are strings
+raw_for_scoring.columns = raw_for_scoring.columns.map(lambda c: str(c))
 
-# Add missing expected columns with zeros if needed
+# 2) try to extract expected columns from pipeline preprocessor and normalize them too
+expected_cols = None
 try:
     preproc = pipeline.named_steps.get('preproc', pipeline.named_steps.get('preprocessor', None))
-    expected_cols = []
     if preproc is not None and hasattr(preproc, 'transformers_'):
-        for name, trans, cols in preproc.transformers_:
+        expected_cols = []
+        for name, transformer, cols in preproc.transformers_:
+            if cols in ('drop', 'passthrough') or cols is None:
+                continue
             if isinstance(cols, (list, tuple, np.ndarray)):
-                expected_cols.extend(list(cols))
+                expected_cols.extend([str(x) for x in cols])
+            else:
+                # cols might be a single column name or slice, try to stringify
+                try:
+                    expected_cols.append(str(cols))
+                except Exception:
+                    pass
+        # dedupe while preserving order
+        seen = set()
+        expected_cols = [x for x in expected_cols if not (x in seen or seen.add(x))]
+except Exception:
+    expected_cols = None
+
+# 3) align input to expected columns if available
+if expected_cols:
     for c in expected_cols:
         if c not in raw_for_scoring.columns:
             raw_for_scoring[c] = 0
-except Exception:
-    pass
+    other_cols = [c for c in raw_for_scoring.columns if c not in expected_cols]
+    reorder = expected_cols + other_cols
+    seen = set()
+    reorder = [c for c in reorder if not (c in seen or seen.add(c))]
+    raw_for_scoring = raw_for_scoring.reindex(columns=reorder, fill_value=0)
+else:
+    # fallback: ensure unique string column names
+    raw_for_scoring.columns = raw_for_scoring.columns.map(lambda c: str(c))
+    if raw_for_scoring.columns.duplicated().any():
+        cols = []
+        counts = {}
+        for c in raw_for_scoring.columns:
+            counts[c] = counts.get(c, 0) + 1
+            cols.append(c if counts[c] == 1 else f"{c}_{counts[c]}")
+        raw_for_scoring.columns = cols
 
-# Predict
+# Try prediction
 try:
     probs_all = pipeline.predict_proba(raw_for_scoring)[:,1]
 except Exception as e:
-    st.error(f"Model prediction failed: {e}")
+    st.error(
+        "Model prediction failed after column normalization. "
+        "This usually means the pipeline expects different columns than supplied."
+    )
+    # helpful debug info (safe)
+    st.write("Input columns (sample):", list(raw_for_scoring.columns)[:100])
+    if expected_cols:
+        st.write("Expected columns (sample):", expected_cols[:100])
     st.stop()
 
 out = uploaded_df.copy()
