@@ -36,27 +36,21 @@ def load_pipeline():
     return None
 
 def build_pipeline(numeric_cols, categorical_cols, classifier=None):
-    """
-    Build a ColumnTransformer + Pipeline that handles unknown categories (OneHotEncoder(handle_unknown='ignore')).
-    classifier: sklearn estimator. Defaults to RandomForestClassifier(n_estimators=200)
-    """
     if classifier is None:
         classifier = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)
     transformers = []
     if numeric_cols:
         transformers.append(("num", StandardScaler(), numeric_cols))
     if categorical_cols:
-        transformers.append(("cat", OneHotEncoder(handle_unknown='ignore', sparse=False), categorical_cols))
+        # sklearn >=1.6 uses sparse_output
+        ohe = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
+        transformers.append(("cat", ohe, categorical_cols))
     preproc = ColumnTransformer(transformers, remainder="drop")
-    pipe = Pipeline([
-        ("preproc", preproc),
-        ("clf", classifier)
-    ])
+    pipe = Pipeline([("preproc", preproc), ("clf", classifier)])
     return pipe
 
 def detect_target_candidates(df):
     candidates = [c for c in df.columns if 'convert' in c.lower() or 'converted' in c.lower() or 'target' in c.lower()]
-    # also consider binary columns
     if not candidates:
         for c in df.columns:
             u = df[c].dropna().unique()
@@ -66,18 +60,31 @@ def detect_target_candidates(df):
     return candidates
 
 def extract_feature_names(pipeline, input_df):
+    try:
+        preproc = pipeline.named_steps.get('preproc', None)
+        if preproc is None:
+            return None
+        # get_feature_names_out may exist on ColumnTransformer in sklearn >=1.0
+        names = preproc.get_feature_names_out(input_df.columns)
+        return list(names)
+    except Exception:
+        return None
+
+def get_pipeline_classifier_name(pipeline):
     """
-    Attempt to get feature names after preprocessing for use with feature importances.
-    Returns list of names or None.
+    Return (estimator_object, estimator_class_name) robustly from a sklearn Pipeline.
     """
     try:
-        preproc = pipeline.named_steps['preproc']
-        # For ColumnTransformer with OneHotEncoder(s), use get_feature_names_out
-        feature_names = preproc.get_feature_names_out(input_df.columns)
-        return list(feature_names)
+        if hasattr(pipeline, "steps") and len(pipeline.steps) > 0:
+            clf_obj = pipeline.steps[-1][1]
+            return clf_obj, type(clf_obj).__name__
+        for key in ("clf", "model", "estimator"):
+            if key in getattr(pipeline, "named_steps", {}):
+                clf_obj = pipeline.named_steps[key]
+                return clf_obj, type(clf_obj).__name__
     except Exception:
-        # fallback: return None
-        return None
+        return None, None
+    return None, None
 
 # ---------------------
 # UI: upload / sample
@@ -90,8 +97,11 @@ with col2:
     st.write("Pipeline artifact:")
     pipeline = load_pipeline()
     if pipeline is not None:
-        st.success("Saved pipeline found: models/lead_pipeline_compressed.joblib")
-        st.write("Model type:", type(pipeline.named_steps['clf']).__name__)
+        clf_obj, clf_name = get_pipeline_classifier_name(pipeline)
+        if clf_name:
+            st.success(f"Saved pipeline found (models/lead_pipeline_compressed.joblib) — Model type: {clf_name}")
+        else:
+            st.success("Saved pipeline found (models/lead_pipeline_compressed.joblib)")
     else:
         st.info("No saved pipeline found. You can upload labeled data and train a pipeline in-app.")
 
@@ -138,35 +148,29 @@ if target_col == "":
 if target_col and target_col in uploaded_df.columns:
     st.subheader("Train pipeline from uploaded data (optional)")
     if st.button("Train pipeline now"):
-        # prepare feature lists (use raw columns excluding target)
         raw_X = uploaded_df.drop(columns=[target_col]).copy()
         y = uploaded_df[target_col].astype(int).copy()
 
-        # Identify numeric and categorical columns
         numeric_cols = raw_X.select_dtypes(include=['number']).columns.tolist()
         categorical_cols = raw_X.select_dtypes(include=['object','category','bool']).columns.tolist()
 
         st.write(f"Detected numeric cols: {numeric_cols}")
         st.write(f"Detected categorical cols: {categorical_cols}")
 
-        # Build pipeline
         pipe = build_pipeline(numeric_cols=numeric_cols, categorical_cols=categorical_cols,
                               classifier=RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1))
 
-        # Train-test split
         X_train, X_test, y_train, y_test = train_test_split(raw_X, y, stratify=y, test_size=0.2, random_state=42)
         with st.spinner("Training pipeline..."):
             pipe.fit(X_train, y_train)
-        # Evaluate
         probs = pipe.predict_proba(X_test)[:,1]
         auc = roc_auc_score(y_test, probs)
         st.success(f"Trained pipeline. ROC-AUC on holdout: {auc:.3f}")
 
-        # Save compressed pipeline
         try:
             joblib.dump(pipe, PIPELINE_PATH, compress=3)
             st.write(f"Saved compressed pipeline to {PIPELINE_PATH}")
-            pipeline = pipe  # set for scoring immed.
+            pipeline = pipe
         except Exception as e:
             st.warning(f"Failed to save pipeline: {e}")
             pipeline = pipe
@@ -185,33 +189,22 @@ if pipeline is None:
 # Scoring: use raw uploaded data (predict_proba handles preprocessing)
 # ---------------------
 st.subheader("Score leads using pipeline")
-# Prepare raw data to pass to pipeline: the pipeline expects the same raw columns used at training.
-# If pipeline was trained earlier, its preprocessor expects certain columns; ColumnTransformer will select specified columns.
-# We pass the entire uploaded_df (dropping target if present) and pipeline's ColumnTransformer will pick necessary columns.
 raw_for_scoring = uploaded_df.copy()
 if target_col and target_col in raw_for_scoring.columns:
     raw_for_scoring = raw_for_scoring.drop(columns=[target_col])
 
-# Some pipelines require exact column order, but ColumnTransformer uses column names; ensure same names exist.
-# If pipeline was trained on columns not present now, that's okay: OneHotEncoder(handle_unknown='ignore') handles unseen categories.
-# However missing numeric columns used by preprocessor will cause errors; we detect and add missing numeric cols with zeros.
+# If the pipeline's preprocessor expects certain numeric columns, add missing numeric cols with zeros
 try:
-    preproc = pipeline.named_steps.get('preproc', None)
+    preproc = pipeline.named_steps.get('preproc', pipeline.named_steps.get('preprocessor', None))
+    expected_cols = []
     if preproc is not None and hasattr(preproc, 'transformers_'):
-        # gather the input columns expected by ColumnTransformer
-        expected_cols = []
         for name, trans, cols in preproc.transformers_:
-            if cols == 'drop' or cols == 'passthrough':
-                continue
-            # cols may be a list of names (when saved with names), or slice-like; handle list-like
             if isinstance(cols, (list, tuple, np.ndarray)):
                 expected_cols.extend(list(cols))
-        # Add missing expected cols with zeros
-        for c in expected_cols:
-            if c not in raw_for_scoring.columns:
-                raw_for_scoring[c] = 0
+    for c in expected_cols:
+        if c not in raw_for_scoring.columns:
+            raw_for_scoring[c] = 0
 except Exception:
-    # if anything fails, we continue; pipeline will attempt transform and may raise helpful error
     pass
 
 # Try prediction
@@ -245,29 +238,28 @@ out_sorted['high_priority'] = (out_sorted['lead_score'] >= threshold).astype(int
 st.write(f"High priority leads (score >= {threshold}): {int(out_sorted['high_priority'].sum())}")
 
 # Feature importance (if tree model)
-if hasattr(pipeline.named_steps['clf'], 'feature_importances_'):
+clf_obj, clf_name = get_pipeline_classifier_name(pipeline)
+if clf_obj is not None and hasattr(clf_obj, 'feature_importances_'):
     st.subheader("Top feature importances")
-    # Attempt to extract feature names after preprocessing
     feat_names = extract_feature_names(pipeline, raw_for_scoring)
     try:
-        importances = pipeline.named_steps['clf'].feature_importances_
+        importances = clf_obj.feature_importances_
         if feat_names is not None and len(feat_names) == len(importances):
             feat_imp = pd.Series(importances, index=feat_names).sort_values(ascending=False).head(30)
             fig2, ax2 = plt.subplots(figsize=(6,6))
             sns.barplot(x=feat_imp.values[::-1], y=feat_imp.index[::-1], ax=ax2)
             st.pyplot(fig2)
         else:
-            # fallback: show top importances by index
             feat_imp = pd.Series(importances).sort_values(ascending=False).head(30)
             st.write("Top importances (index-based):")
             st.table(feat_imp)
     except Exception as e:
         st.warning(f"Could not extract feature importances: {e}")
-elif hasattr(pipeline.named_steps['clf'], 'coef_'):
+elif clf_obj is not None and hasattr(clf_obj, 'coef_'):
     st.subheader("Top coefficients (linear model)")
     try:
         feat_names = extract_feature_names(pipeline, raw_for_scoring)
-        coefs = pipeline.named_steps['clf'].coef_[0]
+        coefs = clf_obj.coef_[0]
         if feat_names is not None and len(feat_names) == len(coefs):
             coefs_s = pd.Series(coefs, index=feat_names).sort_values(key=abs, ascending=False).head(30)
             st.table(coefs_s)
