@@ -42,7 +42,7 @@ def build_pipeline(numeric_cols, categorical_cols, classifier=None):
     if numeric_cols:
         transformers.append(("num", StandardScaler(), numeric_cols))
     if categorical_cols:
-        # sklearn >=1.6 uses sparse_output
+        # sklearn >=1.6 uses sparse_output instead of sparse
         ohe = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
         transformers.append(("cat", ohe, categorical_cols))
     preproc = ColumnTransformer(transformers, remainder="drop")
@@ -64,7 +64,6 @@ def extract_feature_names(pipeline, input_df):
         preproc = pipeline.named_steps.get('preproc', None)
         if preproc is None:
             return None
-        # get_feature_names_out may exist on ColumnTransformer in sklearn >=1.0
         names = preproc.get_feature_names_out(input_df.columns)
         return list(names)
     except Exception:
@@ -99,9 +98,9 @@ with col2:
     if pipeline is not None:
         clf_obj, clf_name = get_pipeline_classifier_name(pipeline)
         if clf_name:
-            st.success(f"Saved pipeline found (models/lead_pipeline_compressed.joblib) — Model type: {clf_name}")
+            st.success(f"Saved pipeline found — Model type: {clf_name}")
         else:
-            st.success("Saved pipeline found (models/lead_pipeline_compressed.joblib)")
+            st.success("Saved pipeline found.")
     else:
         st.info("No saved pipeline found. You can upload labeled data and train a pipeline in-app.")
 
@@ -193,7 +192,10 @@ raw_for_scoring = uploaded_df.copy()
 if target_col and target_col in raw_for_scoring.columns:
     raw_for_scoring = raw_for_scoring.drop(columns=[target_col])
 
-# If the pipeline's preprocessor expects certain numeric columns, add missing numeric cols with zeros
+# ✅ FIX: ensure all column names are strings to avoid mixed-type KeyError
+raw_for_scoring.columns = raw_for_scoring.columns.map(str)
+
+# Add missing expected columns with zeros if needed
 try:
     preproc = pipeline.named_steps.get('preproc', pipeline.named_steps.get('preprocessor', None))
     expected_cols = []
@@ -207,7 +209,7 @@ try:
 except Exception:
     pass
 
-# Try prediction
+# Predict
 try:
     probs_all = pipeline.predict_proba(raw_for_scoring)[:,1]
 except Exception as e:
