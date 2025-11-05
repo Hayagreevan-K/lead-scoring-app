@@ -1,131 +1,102 @@
-# streamlit_app.py
+# app/streamlit_app.py
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
-import os
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
 
-st.set_page_config(page_title="Lead Scoring Demo", layout="wide")
+st.set_page_config(page_title="Lead Scoring (Pipeline)", layout="wide")
+st.title("Sales Lead Scoring — Robust Pipeline Demo")
 
-# -----------------------
-# Config: compressed model filenames (from Kaggle training with joblib.compress)
-# -----------------------
-MODEL_PATH = "models/lead_model_compressed.joblib"
-SCALER_PATH = "models/scaler_compressed.joblib"
+# Paths
+PIPELINE_PATH = "models/lead_pipeline_compressed.joblib"
 os.makedirs("models", exist_ok=True)
 
-# -----------------------
-# Utility / Preprocess functions
-# -----------------------
-def basic_clean(df):
-    df = df.copy()
-    # drop obvious id columns
-    drop_candidates = [c for c in df.columns if c.lower().strip() in ('lead_id','id','leadid','slno','sr_no','serial')]
-    drop_candidates += [c for c in df.columns if 'url' in c.lower() or 'link' in c.lower()]
-    df = df.drop(columns=[c for c in drop_candidates if c in df.columns], errors='ignore')
-    return df
-
-def simple_impute(df):
-    df = df.copy()
-    num_cols = df.select_dtypes(include=['number']).columns.tolist()
-    cat_cols = df.select_dtypes(include=['object','category']).columns.tolist()
-    for c in num_cols:
-        df[c] = df[c].fillna(df[c].median())
-    for c in cat_cols:
-        df[c] = df[c].fillna('unknown')
-    return df
-
-def map_bool_like(df):
-    df = df.copy()
-    bool_map = {'yes':1,'no':0,'y':1,'n':0,'true':1,'false':0,'1':1,'0':0}
-    for c in df.select_dtypes(include='object').columns:
-        s = df[c].dropna().astype(str).str.lower().unique()[:20]
-        if set(s).issubset(set(bool_map.keys())):
-            df[c] = df[c].map(lambda x: bool_map.get(str(x).lower(), np.nan)).fillna(0).astype(int)
-    return df
-
-def encode_features(df, drop_first=True, low_card_thresh=15):
-    df = df.copy()
-    cat_cols = df.select_dtypes(include='object').columns.tolist()
-    low_card = [c for c in cat_cols if df[c].nunique() <= low_card_thresh]
-    high_card = [c for c in cat_cols if c not in low_card]
-    # one-hot low-card
-    if low_card:
-        df = pd.get_dummies(df, columns=low_card, drop_first=drop_first)
-    # frequency encode high-card
-    for c in high_card:
-        freq = df[c].value_counts(normalize=True)
-        df[c + '_freq'] = df[c].map(freq).fillna(0)
-        df.drop(columns=[c], inplace=True)
-    return df
-
-def prepare_features(raw_df, target_col=None):
-    df = basic_clean(raw_df)
-    df = simple_impute(df)
-    df = map_bool_like(df)
-    df_feat = encode_features(df)
-    # build feature list
-    if target_col and target_col in df_feat.columns:
-        feature_cols = [c for c in df_feat.columns if c != target_col]
-    else:
-        feature_cols = df_feat.columns.tolist()
-    return df_feat, feature_cols
-
-# -----------------------
-# Model helpers
-# -----------------------
+# ---------------------
+# Helpers
+# ---------------------
 @st.cache_data(show_spinner=False)
-def load_artifacts():
-    model, scaler = None, None
-    if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
+def load_pipeline():
+    if os.path.exists(PIPELINE_PATH):
         try:
-            model = joblib.load(MODEL_PATH)
-            scaler = joblib.load(SCALER_PATH)
+            pipe = joblib.load(PIPELINE_PATH)
+            return pipe
         except Exception as e:
-            st.warning("Could not load saved model/scaler: " + str(e))
-    return model, scaler
+            st.warning(f"Failed to load saved pipeline: {e}")
+            return None
+    return None
 
-def train_quick_model(X, y):
-    X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, test_size=0.2, random_state=42)
-    numeric_cols = X_train.select_dtypes(include='number').columns.tolist()
-    scaler = StandardScaler()
+def build_pipeline(numeric_cols, categorical_cols, classifier=None):
+    """
+    Build a ColumnTransformer + Pipeline that handles unknown categories (OneHotEncoder(handle_unknown='ignore')).
+    classifier: sklearn estimator. Defaults to RandomForestClassifier(n_estimators=200)
+    """
+    if classifier is None:
+        classifier = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)
+    transformers = []
     if numeric_cols:
-        X_train[numeric_cols] = scaler.fit_transform(X_train[numeric_cols])
-        X_test[numeric_cols] = scaler.transform(X_test[numeric_cols])
-    model = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)
-    model.fit(X_train, y_train)
-    probs = model.predict_proba(X_test)[:,1]
-    auc = roc_auc_score(y_test, probs)
-    return model, scaler, auc
+        transformers.append(("num", StandardScaler(), numeric_cols))
+    if categorical_cols:
+        transformers.append(("cat", OneHotEncoder(handle_unknown='ignore', sparse=False), categorical_cols))
+    preproc = ColumnTransformer(transformers, remainder="drop")
+    pipe = Pipeline([
+        ("preproc", preproc),
+        ("clf", classifier)
+    ])
+    return pipe
 
-# -----------------------
-# Streamlit UI
-# -----------------------
-st.title("Sales Lead Scoring — Demo")
-st.markdown("Upload a leads CSV (with a target column for training) or use the sample dataset. The app will try to load compressed model artifacts from `models/`.")
+def detect_target_candidates(df):
+    candidates = [c for c in df.columns if 'convert' in c.lower() or 'converted' in c.lower() or 'target' in c.lower()]
+    # also consider binary columns
+    if not candidates:
+        for c in df.columns:
+            u = df[c].dropna().unique()
+            if set(u).issubset({0,1}) or len(u) == 2:
+                candidates.append(c)
+                break
+    return candidates
 
+def extract_feature_names(pipeline, input_df):
+    """
+    Attempt to get feature names after preprocessing for use with feature importances.
+    Returns list of names or None.
+    """
+    try:
+        preproc = pipeline.named_steps['preproc']
+        # For ColumnTransformer with OneHotEncoder(s), use get_feature_names_out
+        feature_names = preproc.get_feature_names_out(input_df.columns)
+        return list(feature_names)
+    except Exception:
+        # fallback: return None
+        return None
+
+# ---------------------
+# UI: upload / sample
+# ---------------------
 col1, col2 = st.columns([2,1])
 with col1:
-    uploaded = st.file_uploader("Upload CSV", type=['csv'])
-    sample_btn = st.button("Use sample demo dataset")
+    uploaded = st.file_uploader("Upload leads CSV", type=["csv"])
+    use_sample = st.button("Use small synthetic demo dataset")
 with col2:
-    st.write("Model artifacts:")
-    model, scaler = load_artifacts()
-    if model is not None:
-        st.success(f"Pretrained compressed model found: {MODEL_PATH}")
-        st.write("Model type:", type(model).__name__)
+    st.write("Pipeline artifact:")
+    pipeline = load_pipeline()
+    if pipeline is not None:
+        st.success("Saved pipeline found: models/lead_pipeline_compressed.joblib")
+        st.write("Model type:", type(pipeline.named_steps['clf']).__name__)
     else:
-        st.info("No pretrained compressed model found. You can upload labeled data to train a quick model.")
+        st.info("No saved pipeline found. You can upload labeled data and train a pipeline in-app.")
 
-# Create demo dataset if requested
-if sample_btn:
+# Prepare uploaded_df
+if use_sample:
     st.info("Creating small synthetic demo dataset.")
     np.random.seed(42)
     n = 800
@@ -138,87 +109,120 @@ if sample_btn:
     })
     demo['Converted'] = ((demo['visits']>3) & (demo['previous_purchases']>0)).astype(int)
     uploaded_df = demo.copy()
+elif uploaded is not None:
+    try:
+        uploaded_df = pd.read_csv(uploaded)
+    except Exception as e:
+        st.error(f"Error reading CSV: {e}")
+        st.stop()
 else:
-    uploaded_df = None
-    if uploaded is not None:
-        try:
-            uploaded_df = pd.read_csv(uploaded)
-        except Exception as e:
-            st.error("Error reading CSV: " + str(e))
-
-if uploaded_df is None:
-    st.info("Upload a CSV or click 'Use sample demo dataset' to proceed.")
+    st.info("Upload a CSV or use the sample dataset to proceed.")
     st.stop()
 
-st.subheader("Preview data")
+st.subheader("Preview uploaded data")
 st.dataframe(uploaded_df.head(10))
 
-# Detect possible target columns
-possible_targets = [c for c in uploaded_df.columns if 'convert' in c.lower() or 'converted' in c.lower() or 'target' in c.lower()]
+# Detect target candidates and let user choose
+candidates = detect_target_candidates(uploaded_df)
 target_col = None
-if possible_targets:
-    target_col = st.selectbox("Detected target candidates (choose if you want to train)", options=possible_targets, index=0)
+if candidates:
+    target_col = st.selectbox("Detected target candidates (choose if you want to train)", options=candidates, index=0)
 else:
-    target_col = st.text_input("Enter target column name (if training). Leave empty to just score with pretrained model:", value="")
-
+    target_col = st.text_input("Enter target column name (if you want to train). Leave blank to just score with saved pipeline:", value="")
 if target_col == "":
     target_col = None
 
-# Prepare features
-df_feat, feature_cols = prepare_features(uploaded_df, target_col=target_col)
-st.write(f"Prepared features count: {len(feature_cols)}")
+# ---------------------
+# If training: build pipeline and train
+# ---------------------
+if target_col and target_col in uploaded_df.columns:
+    st.subheader("Train pipeline from uploaded data (optional)")
+    if st.button("Train pipeline now"):
+        # prepare feature lists (use raw columns excluding target)
+        raw_X = uploaded_df.drop(columns=[target_col]).copy()
+        y = uploaded_df[target_col].astype(int).copy()
 
-# Option to train quick model if labeled data present
-if target_col and target_col in df_feat.columns:
-    st.subheader("Train model from uploaded data (optional)")
-    if st.button("Train model now"):
-        X = df_feat[[c for c in feature_cols if c != target_col]].copy() if target_col in feature_cols else df_feat[feature_cols].copy()
-        y = df_feat[target_col].astype(int)
-        if target_col in X.columns:
-            X = X.drop(columns=[target_col])
-        model_tr, scaler_tr, auc = train_quick_model(X, y)
-        st.success(f"Trained RandomForest. ROC-AUC on holdout: {auc:.3f}")
-        model = model_tr
-        scaler = scaler_tr
-        # Save compressed artifacts (small)
+        # Identify numeric and categorical columns
+        numeric_cols = raw_X.select_dtypes(include=['number']).columns.tolist()
+        categorical_cols = raw_X.select_dtypes(include=['object','category','bool']).columns.tolist()
+
+        st.write(f"Detected numeric cols: {numeric_cols}")
+        st.write(f"Detected categorical cols: {categorical_cols}")
+
+        # Build pipeline
+        pipe = build_pipeline(numeric_cols=numeric_cols, categorical_cols=categorical_cols,
+                              classifier=RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1))
+
+        # Train-test split
+        X_train, X_test, y_train, y_test = train_test_split(raw_X, y, stratify=y, test_size=0.2, random_state=42)
+        with st.spinner("Training pipeline..."):
+            pipe.fit(X_train, y_train)
+        # Evaluate
+        probs = pipe.predict_proba(X_test)[:,1]
+        auc = roc_auc_score(y_test, probs)
+        st.success(f"Trained pipeline. ROC-AUC on holdout: {auc:.3f}")
+
+        # Save compressed pipeline
         try:
-            joblib.dump(model, MODEL_PATH, compress=3)
-            joblib.dump(scaler, SCALER_PATH, compress=3)
-            st.write(f"Saved compressed model/scaler to {MODEL_PATH} and {SCALER_PATH}")
+            joblib.dump(pipe, PIPELINE_PATH, compress=3)
+            st.write(f"Saved compressed pipeline to {PIPELINE_PATH}")
+            pipeline = pipe  # set for scoring immed.
         except Exception as e:
-            st.warning("Could not save artifacts: " + str(e))
+            st.warning(f"Failed to save pipeline: {e}")
+            pipeline = pipe
 else:
-    st.info("No labeled target provided for training. Will use pretrained compressed model if available to score uploaded leads.")
+    st.info("No target selected for training. If a saved pipeline exists it will be used for scoring.")
 
-# Ensure model exists
-if model is None:
-    st.warning("No model available. Provide labeled data and click 'Train model now' OR place compressed model files in models/ and reload.")
+# ---------------------
+# Ensure pipeline available
+# ---------------------
+pipeline = pipeline if 'pipeline' in locals() and pipeline is not None else load_pipeline()
+if pipeline is None:
+    st.warning("No pipeline available. Provide labeled data and train, or upload a pipeline at models/lead_pipeline_compressed.joblib.")
     st.stop()
 
-# Build X_all for scoring
-X_all = df_feat[feature_cols].copy()
-# If target present in features, drop it before scoring
-if target_col and target_col in X_all.columns:
-    X_all = X_all.drop(columns=[target_col])
+# ---------------------
+# Scoring: use raw uploaded data (predict_proba handles preprocessing)
+# ---------------------
+st.subheader("Score leads using pipeline")
+# Prepare raw data to pass to pipeline: the pipeline expects the same raw columns used at training.
+# If pipeline was trained earlier, its preprocessor expects certain columns; ColumnTransformer will select specified columns.
+# We pass the entire uploaded_df (dropping target if present) and pipeline's ColumnTransformer will pick necessary columns.
+raw_for_scoring = uploaded_df.copy()
+if target_col and target_col in raw_for_scoring.columns:
+    raw_for_scoring = raw_for_scoring.drop(columns=[target_col])
 
-numeric_cols = X_all.select_dtypes(include='number').columns.tolist()
-if scaler is not None and numeric_cols:
-    try:
-        X_all[numeric_cols] = scaler.transform(X_all[numeric_cols])
-    except Exception as e:
-        st.warning("Scaler transform failed; attempting fit_transform.")
-        scaler = StandardScaler()
-        X_all[numeric_cols] = scaler.fit_transform(X_all[numeric_cols])
-
-# Predict probabilities
+# Some pipelines require exact column order, but ColumnTransformer uses column names; ensure same names exist.
+# If pipeline was trained on columns not present now, that's okay: OneHotEncoder(handle_unknown='ignore') handles unseen categories.
+# However missing numeric columns used by preprocessor will cause errors; we detect and add missing numeric cols with zeros.
 try:
-    probs = model.predict_proba(X_all)[:,1]
+    preproc = pipeline.named_steps.get('preproc', None)
+    if preproc is not None and hasattr(preproc, 'transformers_'):
+        # gather the input columns expected by ColumnTransformer
+        expected_cols = []
+        for name, trans, cols in preproc.transformers_:
+            if cols == 'drop' or cols == 'passthrough':
+                continue
+            # cols may be a list of names (when saved with names), or slice-like; handle list-like
+            if isinstance(cols, (list, tuple, np.ndarray)):
+                expected_cols.extend(list(cols))
+        # Add missing expected cols with zeros
+        for c in expected_cols:
+            if c not in raw_for_scoring.columns:
+                raw_for_scoring[c] = 0
+except Exception:
+    # if anything fails, we continue; pipeline will attempt transform and may raise helpful error
+    pass
+
+# Try prediction
+try:
+    probs_all = pipeline.predict_proba(raw_for_scoring)[:,1]
 except Exception as e:
-    st.error("Model prediction failed: " + str(e))
+    st.error(f"Model prediction failed: {e}")
     st.stop()
 
 out = uploaded_df.copy()
-out['lead_score'] = probs
+out['lead_score'] = probs_all
 out['lead_rank'] = out['lead_score'].rank(ascending=False, method='first')
 out_sorted = out.sort_values('lead_score', ascending=False)
 
@@ -234,27 +238,43 @@ sns.histplot(out_sorted['lead_score'], bins=40, kde=True, ax=ax)
 ax.set_xlabel("Lead score")
 st.pyplot(fig)
 
-# Thresholding & flags
-st.subheader("Threshold & Flags")
-threshold = st.slider("Select lead score threshold to mark 'High Priority' leads", 0.0, 1.0, 0.6, 0.01)
+# Thresholding
+st.subheader("Threshold & flags")
+threshold = st.slider("Select threshold for 'High Priority' leads", 0.0, 1.0, 0.6, 0.01)
 out_sorted['high_priority'] = (out_sorted['lead_score'] >= threshold).astype(int)
-hp_count = int(out_sorted['high_priority'].sum())
-st.write(f"High priority leads (score >= {threshold}): {hp_count}")
+st.write(f"High priority leads (score >= {threshold}): {int(out_sorted['high_priority'].sum())}")
 
-# Feature importance (if available)
-if hasattr(model, 'feature_importances_'):
+# Feature importance (if tree model)
+if hasattr(pipeline.named_steps['clf'], 'feature_importances_'):
     st.subheader("Top feature importances")
+    # Attempt to extract feature names after preprocessing
+    feat_names = extract_feature_names(pipeline, raw_for_scoring)
     try:
-        feat_imp = pd.Series(model.feature_importances_, index=X_all.columns).sort_values(ascending=False).head(20)
-        fig2, ax2 = plt.subplots(figsize=(6,6))
-        sns.barplot(x=feat_imp.values[::-1], y=feat_imp.index[::-1], ax=ax2)
-        st.pyplot(fig2)
+        importances = pipeline.named_steps['clf'].feature_importances_
+        if feat_names is not None and len(feat_names) == len(importances):
+            feat_imp = pd.Series(importances, index=feat_names).sort_values(ascending=False).head(30)
+            fig2, ax2 = plt.subplots(figsize=(6,6))
+            sns.barplot(x=feat_imp.values[::-1], y=feat_imp.index[::-1], ax=ax2)
+            st.pyplot(fig2)
+        else:
+            # fallback: show top importances by index
+            feat_imp = pd.Series(importances).sort_values(ascending=False).head(30)
+            st.write("Top importances (index-based):")
+            st.table(feat_imp)
     except Exception as e:
-        st.warning("Could not plot feature importances: " + str(e))
-elif hasattr(model, 'coef_'):
+        st.warning(f"Could not extract feature importances: {e}")
+elif hasattr(pipeline.named_steps['clf'], 'coef_'):
     st.subheader("Top coefficients (linear model)")
-    coefs = pd.Series(model.coef_[0], index=X_all.columns).sort_values(key=abs, ascending=False).head(20)
-    st.table(coefs)
+    try:
+        feat_names = extract_feature_names(pipeline, raw_for_scoring)
+        coefs = pipeline.named_steps['clf'].coef_[0]
+        if feat_names is not None and len(feat_names) == len(coefs):
+            coefs_s = pd.Series(coefs, index=feat_names).sort_values(key=abs, ascending=False).head(30)
+            st.table(coefs_s)
+        else:
+            st.table(pd.Series(coefs).head(30))
+    except Exception as e:
+        st.warning(f"Could not show coefficients: {e}")
 
 # Download options
 st.subheader("Download scored leads")
@@ -263,4 +283,4 @@ st.download_button("Download all scored leads (CSV)", csv, "scored_leads_full.cs
 st.download_button("Download top leads (CSV)", out_sorted.head(top_n).to_csv(index=False), f"scored_leads_top{top_n}.csv", "text/csv")
 
 st.markdown("---")
-st.caption("Note: For production, ensure identical feature pipeline used for training & scoring and add model monitoring.")
+st.caption("Note: For production, ensure the same schema is used for training & scoring and implement monitoring for data drift.")
