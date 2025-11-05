@@ -5,5 +5,4 @@ This project uses a Machine Learning pipeline to predict and prioritize sales le
 🔗 **Live Demo:**  
 [Click here to open the Streamlit App 🚀](https://lead-scoring-app-vfayuyg6qg57essprmmptp.streamlit.app/)
 
-📁 **Repository Structure**
 
