@@ -42,11 +42,10 @@ def build_pipeline(numeric_cols, categorical_cols, classifier=None):
     if numeric_cols:
         transformers.append(("num", StandardScaler(), numeric_cols))
     if categorical_cols:
-        # sklearn >=1.6 uses sparse_output instead of sparse
+        # sklearn >=1.6 uses sparse_output
         ohe = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
         transformers.append(("cat", ohe, categorical_cols))
     preproc = ColumnTransformer(transformers, remainder="drop")
-    # final estimator step name 'clf' (robust detection logic elsewhere)
     pipe = Pipeline([("preproc", preproc), ("clf", classifier)])
     return pipe
 
@@ -54,8 +53,8 @@ def detect_target_candidates(df):
     candidates = [c for c in df.columns if 'convert' in c.lower() or 'converted' in c.lower() or 'target' in c.lower()]
     if not candidates:
         for c in df.columns:
-            u = df[c].dropna().unique()
             try:
+                u = df[c].dropna().unique()
                 if set(u).issubset({0,1}) or len(u) == 2:
                     candidates.append(c)
                     break
@@ -74,9 +73,6 @@ def extract_feature_names(pipeline, input_df):
         return None
 
 def get_pipeline_classifier_name(pipeline):
-    """
-    Return (estimator_object, estimator_class_name) robustly from a sklearn Pipeline.
-    """
     try:
         if hasattr(pipeline, "steps") and len(pipeline.steps) > 0:
             clf_obj = pipeline.steps[-1][1]
@@ -189,7 +185,7 @@ if pipeline is None:
     st.stop()
 
 # ---------------------
-# Scoring: use raw uploaded data (predict_proba handles preprocessing)
+# Scoring prep
 # ---------------------
 st.subheader("Score leads using pipeline")
 raw_for_scoring = uploaded_df.copy()
@@ -197,10 +193,10 @@ if target_col and target_col in raw_for_scoring.columns:
     raw_for_scoring = raw_for_scoring.drop(columns=[target_col])
 
 # ---------- Robust column-name normalization & alignment ----------
-# 1) ensure DataFrame column names are strings
+# ensure DataFrame column names are strings
 raw_for_scoring.columns = raw_for_scoring.columns.map(lambda c: str(c))
 
-# 2) try to extract expected columns from pipeline preprocessor and normalize them too
+# try to extract expected columns from pipeline preprocessor and normalize them too
 expected_cols = None
 try:
     preproc = pipeline.named_steps.get('preproc', pipeline.named_steps.get('preprocessor', None))
@@ -222,7 +218,7 @@ try:
 except Exception:
     expected_cols = None
 
-# 3) align input to expected columns if available
+# add missing expected columns filled with zeros, reorder
 if expected_cols:
     for c in expected_cols:
         if c not in raw_for_scoring.columns:
@@ -243,31 +239,111 @@ else:
             cols.append(c if counts[c] == 1 else f"{c}_{counts[c]}")
         raw_for_scoring.columns = cols
 
-# Try prediction
+# ---------------- Diagnostic block: run BEFORE predict_proba ----------------
+st.subheader("🔎 Deep diagnostics (developer)")
+
+# 1) Classifier sanity
+clf_obj, clf_name = get_pipeline_classifier_name(pipeline)
+if clf_obj is None:
+    st.error("Could not detect estimator inside pipeline.")
+else:
+    st.write("Estimator type:", clf_name)
+    try:
+        classes = getattr(clf_obj, "classes_", None)
+        if classes is not None:
+            st.write("Classifier classes_ (sample):", classes[:20], "  total classes:", len(classes))
+        else:
+            st.write("Classifier has no classes_ attribute (maybe not fitted).")
+    except Exception as e:
+        st.write("Error reading classes_:", e)
+
+# 2) Preprocessor transform shape & variance
+try:
+    preproc = pipeline.named_steps.get('preproc', pipeline.named_steps.get('preprocessor', None))
+    if preproc is None:
+        st.info("Pipeline has no preprocessor step exposed as 'preproc'/'preprocessor'. Skipping preproc checks.")
+    else:
+        sample_df = raw_for_scoring.head(min(200, len(raw_for_scoring))).copy()
+        with st.spinner("Running preprocessor.transform for diagnostics..."):
+            X_trans = preproc.transform(sample_df)
+        Xt = np.asarray(X_trans)
+        st.write("Transformed feature matrix shape (sample):", getattr(X_trans, "shape", "unknown"))
+        col_var = np.var(Xt, axis=0)
+        uniq_counts = [np.unique(Xt[:,i]).size for i in range(Xt.shape[1])]
+        n_const = int((col_var <= 1e-8).sum())
+        st.write(f"Transformed features: {Xt.shape[1]} cols, {n_const} constant (near-zero var) columns.")
+        low_var_idx = np.argsort(col_var)[:20]
+        low_var_sample = [{"col_index": int(i), "variance": float(col_var[i]), "unique_vals": int(uniq_counts[i])} for i in low_var_idx[:20]]
+        st.table(low_var_sample)
+        st.write("First 10 transformed feature values (sample rows):")
+        display_df = pd.DataFrame(Xt[:, :10])
+        st.dataframe(display_df.head(8))
+except Exception as e:
+    st.warning(f"Preprocessor diagnostic failed: {e}")
+
+# 3) Count expected cols missing originally
+try:
+    if expected_cols:
+        missing_original = [c for c in expected_cols if c not in uploaded_df.columns.map(str)]
+        st.write("Number of expected cols missing from uploaded file (filled with zeros):", len(missing_original))
+        if len(missing_original) > 0:
+            st.write("Sample missing expected columns:", missing_original[:200])
+except Exception:
+    pass
+
+# 4) Try prediction (safe) and show stats
 try:
     probs_all = pipeline.predict_proba(raw_for_scoring)[:,1]
+    st.success("predict_proba ran successfully.")
+    st.write({
+        "min": float(probs_all.min()),
+        "max": float(probs_all.max()),
+        "mean": float(probs_all.mean()),
+        "unique_count": int(len(np.unique(probs_all))),
+        "n_rows": int(len(probs_all))
+    })
 except Exception as e:
-    st.error(
-        "Model prediction failed after column normalization. "
-        "This usually means the pipeline expects different columns than supplied."
-    )
-    st.write("Input columns (sample):", list(raw_for_scoring.columns)[:200])
-    if expected_cols:
-        st.write("Expected columns (sample):", expected_cols[:200])
+    st.error(f"predict_proba failed: {e}")
     st.stop()
 
-# -------------------------
-# DIAGNOSTIC + PLOTTING + DOWNLOAD (drop-in)
-# -------------------------
+# 5) If classifier appears unfitted or single-class, offer immediate retrain (diagnostic)
+try:
+    classes = getattr(clf_obj, "classes_", None)
+    if classes is None or len(classes) < 2:
+        st.warning("Classifier does not appear to be fitted or has fewer than 2 classes. You should retrain.")
+        if target_col and target_col in uploaded_df.columns:
+            if st.button("Retrain pipeline now (diagnostic)"):
+                st.info("Retraining pipeline on uploaded labeled data (diagnostic only).")
+                raw_X = uploaded_df.drop(columns=[target_col]).copy()
+                y = uploaded_df[target_col].astype(int).copy()
+                num_cols = raw_X.select_dtypes(include=['number']).columns.tolist()
+                cat_cols = raw_X.select_dtypes(include=['object','category','bool']).columns.tolist()
+                test_pipe = build_pipeline(numeric_cols=num_cols, categorical_cols=cat_cols,
+                                           classifier=RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1))
+                X_train, X_test, y_train, y_test = train_test_split(raw_X, y, stratify=y, test_size=0.2, random_state=42)
+                with st.spinner("Training..."):
+                    test_pipe.fit(X_train, y_train)
+                test_probs = test_pipe.predict_proba(raw_for_scoring)[:,1]
+                st.write("Retrain test predict stats:", {
+                    "min": float(test_probs.min()),
+                    "max": float(test_probs.max()),
+                    "mean": float(test_probs.mean()),
+                    "unique_count": int(len(np.unique(test_probs)))
+                })
+                st.success("Retraining diagnostic complete.")
+except Exception:
+    pass
 
-# Attach scores
+# -------------------------
+# DIAGNOSTIC + PLOTTING + DOWNLOAD
+# -------------------------
 out = uploaded_df.copy()
 out['lead_score'] = probs_all
 out['lead_rank'] = out['lead_score'].rank(ascending=False, method='first')
 out_sorted = out.sort_values('lead_score', ascending=False)
 
-# --- DIAGNOSTICS: quick stats
-st.subheader("Prediction diagnostics")
+# diagnostics summary
+st.subheader("Prediction diagnostics summary")
 min_s, max_s = float(out_sorted['lead_score'].min()), float(out_sorted['lead_score'].max())
 mean_s = float(out_sorted['lead_score'].mean())
 unique_count = int(out_sorted['lead_score'].nunique())
@@ -279,11 +355,9 @@ st.write({
     "total_leads": len(out_sorted)
 })
 
-# Show top 10 scored leads for sanity
 st.markdown("**Top 10 scored leads (sanity check)**")
 st.dataframe(out_sorted.head(10).reset_index(drop=True))
 
-# Check for columns with zero variance (these often cause constant predictions)
 st.markdown("**Columns with zero or near-zero variance (in scoring input)**")
 var_report = raw_for_scoring.var(numeric_only=True).sort_values()
 zero_var = var_report[var_report <= 1e-8]
@@ -293,51 +367,26 @@ if len(zero_var) > 0:
 else:
     st.write("No numeric columns with near-zero variance detected.")
 
-# Check if many columns were added as zeros during alignment (these could cause constant inputs)
-st.markdown("**Columns added during alignment (were missing in upload => filled with zeros)**")
+st.markdown("**Columns added during alignment (missing in upload → filled with zeros)**")
 if expected_cols:
     missing_original = [c for c in expected_cols if c not in uploaded_df.columns.map(str)]
     if missing_original:
-        st.write(f"{len(missing_original)} expected columns were missing in the uploaded file and filled with zeros.")
+        st.write(f"{len(missing_original)} expected columns were missing and filled with zeros.")
         st.write(missing_original[:200])
     else:
         st.write("No expected columns were missing from the upload.")
 else:
     st.write("No pipeline expected-columns metadata available to compare.")
 
-# If predictions are constant, offer an on-the-fly retrain (only if labelled data available)
 if unique_count == 1:
-    st.warning("All predicted scores are identical — typically caused by (a) missing features at prediction time, (b) model trained on constant data, or (c) incorrect preprocessing alignment.")
-    st.info("If you uploaded labeled data (a target column), you can retrain a quick pipeline here to confirm variability.")
-    if target_col and target_col in uploaded_df.columns:
-        if st.button("Retrain quick pipeline on uploaded labeled data (test)"):
-            st.info("Retraining a quick RandomForest pipeline to test predictions...")
-            raw_X = uploaded_df.drop(columns=[target_col]).copy()
-            y = uploaded_df[target_col].astype(int).copy()
-            numeric_cols = raw_X.select_dtypes(include=['number']).columns.tolist()
-            categorical_cols = raw_X.select_dtypes(include=['object','category','bool']).columns.tolist()
-            test_pipe = build_pipeline(numeric_cols=numeric_cols, categorical_cols=categorical_cols,
-                                       classifier=RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1))
-            X_train, X_test, y_train, y_test = train_test_split(raw_X, y, stratify=y, test_size=0.2, random_state=42)
-            with st.spinner("Training..."):
-                test_pipe.fit(X_train, y_train)
-            test_probs = test_pipe.predict_proba(raw_for_scoring.drop(columns=[target_col], errors='ignore'))[:,1]
-            st.write({
-                "test_min": float(test_probs.min()),
-                "test_max": float(test_probs.max()),
-                "test_mean": float(test_probs.mean()),
-                "test_unique": int(len(np.unique(test_probs)))
-            })
-            st.success("Retraining complete — results shown above. Use this to debug if pipeline artifact lacks necessary features.")
-    else:
-        st.info("No labeled target present — cannot retrain here.")
+    st.warning("All predicted scores are identical — debugging actions above will help identify why.")
+    st.info("If you uploaded labeled data, use the 'Retrain pipeline now (diagnostic)' button to check variability.")
 
 # --- Correct plotting: histogram with KDE, mean & threshold lines
 st.subheader("Score distribution (corrected plot)")
 fig, ax = plt.subplots(figsize=(8, 4))
 sns.histplot(out_sorted['lead_score'], bins=30, kde=True, stat="count", ax=ax, edgecolor='black')
 ax.axvline(mean_s, color='red', linestyle='--', linewidth=1, label=f"Mean: {mean_s:.3f}")
-# draw threshold if present in session (otherwise skip)
 try:
     threshold
 except NameError:
@@ -350,7 +399,7 @@ ax.set_title("Lead Score Probability Distribution")
 ax.legend()
 st.pyplot(fig)
 
-# --- Continue with top-N table and download buttons
+# Top-N and downloads
 st.subheader("Top scored leads")
 top_n = st.number_input("Show top N leads", min_value=5, max_value=1000, value=50, step=5)
 st.dataframe(out_sorted.head(top_n))
