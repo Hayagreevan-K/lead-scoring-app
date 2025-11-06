@@ -46,6 +46,7 @@ def build_pipeline(numeric_cols, categorical_cols, classifier=None):
         ohe = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
         transformers.append(("cat", ohe, categorical_cols))
     preproc = ColumnTransformer(transformers, remainder="drop")
+    # final estimator step name 'clf' (robust detection logic elsewhere)
     pipe = Pipeline([("preproc", preproc), ("clf", classifier)])
     return pipe
 
@@ -67,7 +68,6 @@ def extract_feature_names(pipeline, input_df):
         preproc = pipeline.named_steps.get('preproc', pipeline.named_steps.get('preprocessor', None))
         if preproc is None:
             return None
-        # get_feature_names_out expects string column names
         names = preproc.get_feature_names_out(input_df.columns)
         return list(names)
     except Exception:
@@ -166,8 +166,8 @@ if target_col and target_col in uploaded_df.columns:
         X_train, X_test, y_train, y_test = train_test_split(raw_X, y, stratify=y, test_size=0.2, random_state=42)
         with st.spinner("Training pipeline..."):
             pipe.fit(X_train, y_train)
-        probs = pipe.predict_proba(X_test)[:,1]
-        auc = roc_auc_score(y_test, probs)
+        probs_test = pipe.predict_proba(X_test)[:,1]
+        auc = roc_auc_score(y_test, probs_test)
         st.success(f"Trained pipeline. ROC-AUC on holdout: {auc:.3f}")
 
         try:
@@ -212,7 +212,6 @@ try:
             if isinstance(cols, (list, tuple, np.ndarray)):
                 expected_cols.extend([str(x) for x in cols])
             else:
-                # cols might be a single column name or slice, try to stringify
                 try:
                     expected_cols.append(str(cols))
                 except Exception:
@@ -252,67 +251,110 @@ except Exception as e:
         "Model prediction failed after column normalization. "
         "This usually means the pipeline expects different columns than supplied."
     )
-    # helpful debug info (safe)
-    st.write("Input columns (sample):", list(raw_for_scoring.columns)[:100])
+    st.write("Input columns (sample):", list(raw_for_scoring.columns)[:200])
     if expected_cols:
-        st.write("Expected columns (sample):", expected_cols[:100])
+        st.write("Expected columns (sample):", expected_cols[:200])
     st.stop()
 
+# -------------------------
+# DIAGNOSTIC + PLOTTING + DOWNLOAD (drop-in)
+# -------------------------
+
+# Attach scores
 out = uploaded_df.copy()
 out['lead_score'] = probs_all
 out['lead_rank'] = out['lead_score'].rank(ascending=False, method='first')
 out_sorted = out.sort_values('lead_score', ascending=False)
 
-# Display top N
+# --- DIAGNOSTICS: quick stats
+st.subheader("Prediction diagnostics")
+min_s, max_s = float(out_sorted['lead_score'].min()), float(out_sorted['lead_score'].max())
+mean_s = float(out_sorted['lead_score'].mean())
+unique_count = int(out_sorted['lead_score'].nunique())
+st.write({
+    "min_score": min_s,
+    "max_score": max_s,
+    "mean_score": mean_s,
+    "unique_scores": unique_count,
+    "total_leads": len(out_sorted)
+})
+
+# Show top 10 scored leads for sanity
+st.markdown("**Top 10 scored leads (sanity check)**")
+st.dataframe(out_sorted.head(10).reset_index(drop=True))
+
+# Check for columns with zero variance (these often cause constant predictions)
+st.markdown("**Columns with zero or near-zero variance (in scoring input)**")
+var_report = raw_for_scoring.var(numeric_only=True).sort_values()
+zero_var = var_report[var_report <= 1e-8]
+if len(zero_var) > 0:
+    st.write(f"Found {len(zero_var)} numeric columns with near-zero variance:")
+    st.table(zero_var)
+else:
+    st.write("No numeric columns with near-zero variance detected.")
+
+# Check if many columns were added as zeros during alignment (these could cause constant inputs)
+st.markdown("**Columns added during alignment (were missing in upload => filled with zeros)**")
+if expected_cols:
+    missing_original = [c for c in expected_cols if c not in uploaded_df.columns.map(str)]
+    if missing_original:
+        st.write(f"{len(missing_original)} expected columns were missing in the uploaded file and filled with zeros.")
+        st.write(missing_original[:200])
+    else:
+        st.write("No expected columns were missing from the upload.")
+else:
+    st.write("No pipeline expected-columns metadata available to compare.")
+
+# If predictions are constant, offer an on-the-fly retrain (only if labelled data available)
+if unique_count == 1:
+    st.warning("All predicted scores are identical — typically caused by (a) missing features at prediction time, (b) model trained on constant data, or (c) incorrect preprocessing alignment.")
+    st.info("If you uploaded labeled data (a target column), you can retrain a quick pipeline here to confirm variability.")
+    if target_col and target_col in uploaded_df.columns:
+        if st.button("Retrain quick pipeline on uploaded labeled data (test)"):
+            st.info("Retraining a quick RandomForest pipeline to test predictions...")
+            raw_X = uploaded_df.drop(columns=[target_col]).copy()
+            y = uploaded_df[target_col].astype(int).copy()
+            numeric_cols = raw_X.select_dtypes(include=['number']).columns.tolist()
+            categorical_cols = raw_X.select_dtypes(include=['object','category','bool']).columns.tolist()
+            test_pipe = build_pipeline(numeric_cols=numeric_cols, categorical_cols=categorical_cols,
+                                       classifier=RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1))
+            X_train, X_test, y_train, y_test = train_test_split(raw_X, y, stratify=y, test_size=0.2, random_state=42)
+            with st.spinner("Training..."):
+                test_pipe.fit(X_train, y_train)
+            test_probs = test_pipe.predict_proba(raw_for_scoring.drop(columns=[target_col], errors='ignore'))[:,1]
+            st.write({
+                "test_min": float(test_probs.min()),
+                "test_max": float(test_probs.max()),
+                "test_mean": float(test_probs.mean()),
+                "test_unique": int(len(np.unique(test_probs)))
+            })
+            st.success("Retraining complete — results shown above. Use this to debug if pipeline artifact lacks necessary features.")
+    else:
+        st.info("No labeled target present — cannot retrain here.")
+
+# --- Correct plotting: histogram with KDE, mean & threshold lines
+st.subheader("Score distribution (corrected plot)")
+fig, ax = plt.subplots(figsize=(8, 4))
+sns.histplot(out_sorted['lead_score'], bins=30, kde=True, stat="count", ax=ax, edgecolor='black')
+ax.axvline(mean_s, color='red', linestyle='--', linewidth=1, label=f"Mean: {mean_s:.3f}")
+# draw threshold if present in session (otherwise skip)
+try:
+    threshold
+except NameError:
+    threshold = None
+if threshold is not None:
+    ax.axvline(threshold, color='green', linestyle='--', linewidth=1, label=f"Threshold: {threshold:.2f}")
+ax.set_xlabel("Predicted probability (lead score)")
+ax.set_ylabel("Count")
+ax.set_title("Lead Score Probability Distribution")
+ax.legend()
+st.pyplot(fig)
+
+# --- Continue with top-N table and download buttons
 st.subheader("Top scored leads")
 top_n = st.number_input("Show top N leads", min_value=5, max_value=1000, value=50, step=5)
 st.dataframe(out_sorted.head(top_n))
 
-# Score distribution
-st.subheader("Score distribution")
-fig, ax = plt.subplots(figsize=(6,3))
-sns.histplot(out_sorted['lead_score'], bins=40, kde=True, ax=ax)
-ax.set_xlabel("Lead score")
-st.pyplot(fig)
-
-# Thresholding
-st.subheader("Threshold & flags")
-threshold = st.slider("Select threshold for 'High Priority' leads", 0.0, 1.0, 0.6, 0.01)
-out_sorted['high_priority'] = (out_sorted['lead_score'] >= threshold).astype(int)
-st.write(f"High priority leads (score >= {threshold}): {int(out_sorted['high_priority'].sum())}")
-
-# Feature importance (if tree model)
-clf_obj, clf_name = get_pipeline_classifier_name(pipeline)
-if clf_obj is not None and hasattr(clf_obj, 'feature_importances_'):
-    st.subheader("Top feature importances")
-    feat_names = extract_feature_names(pipeline, raw_for_scoring)
-    try:
-        importances = clf_obj.feature_importances_
-        if feat_names is not None and len(feat_names) == len(importances):
-            feat_imp = pd.Series(importances, index=feat_names).sort_values(ascending=False).head(30)
-            fig2, ax2 = plt.subplots(figsize=(6,6))
-            sns.barplot(x=feat_imp.values[::-1], y=feat_imp.index[::-1], ax=ax2)
-            st.pyplot(fig2)
-        else:
-            feat_imp = pd.Series(importances).sort_values(ascending=False).head(30)
-            st.write("Top importances (index-based):")
-            st.table(feat_imp)
-    except Exception as e:
-        st.warning(f"Could not extract feature importances: {e}")
-elif clf_obj is not None and hasattr(clf_obj, 'coef_'):
-    st.subheader("Top coefficients (linear model)")
-    try:
-        feat_names = extract_feature_names(pipeline, raw_for_scoring)
-        coefs = clf_obj.coef_[0]
-        if feat_names is not None and len(feat_names) == len(coefs):
-            coefs_s = pd.Series(coefs, index=feat_names).sort_values(key=abs, ascending=False).head(30)
-            st.table(coefs_s)
-        else:
-            st.table(pd.Series(coefs).head(30))
-    except Exception as e:
-        st.warning(f"Could not show coefficients: {e}")
-
-# Download options
 st.subheader("Download scored leads")
 csv = out_sorted.to_csv(index=False)
 st.download_button("Download all scored leads (CSV)", csv, "scored_leads_full.csv", "text/csv")
